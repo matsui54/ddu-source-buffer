@@ -1,22 +1,16 @@
 import {
+  ActionArguments,
+  ActionFlags,
   BaseSource,
   Item,
-} from "https://deno.land/x/ddu_vim@v1.1.0/types.ts";
-import { Denops, fn } from "https://deno.land/x/ddu_vim@v1.1.0/deps.ts";
-import { relative } from "https://deno.land/std@0.123.0/path/mod.ts#^";
-
-type ActionData = {
-  bufnr: number;
-  path: string;
-  isCurrent: boolean;
-  isAlternate: boolean;
-  isModified: boolean;
-};
-
-type ActionInfo = {
-  word: string;
-  action: ActionData;
-};
+} from "https://deno.land/x/ddu_vim@v1.2.0/types.ts";
+import {
+  batch,
+  Denops,
+  fn,
+  gather,
+} from "https://deno.land/x/ddu_vim@v1.2.0/deps.ts";
+import { ActionData } from "https://deno.land/x/ddu_kind_file@v0.3.0/file.ts";
 
 type Params = Record<never, never>;
 
@@ -26,75 +20,74 @@ export class Source extends BaseSource<Params> {
   gather(args: {
     denops: Denops;
   }): ReadableStream<Item<ActionData>[]> {
-    const get_actioninfo = async(bufnr_: number, path: string): ActionInfo => {
-      const curnr_ = await fn.bufnr(args.denops, "%");
-      const altnr_ = await fn.bufnr(args.denops, "#");
-      const name_ = await fn.bufname(args.denops, bufnr_);
-      const isCurrent_ = curnr_ === bufnr_ ? true : false;
-      const isAlternate_ = altnr_ === bufnr_ ? true : false;
-      const isModified_ = await fn.getbufvar(args.denops, bufnr_, "&modified");
-
-      const curmarker_ = isCurrent_ ? "%" : "";
-      const altmarker_ = isAlternate_ ? "#" : "";
-      const modmarker_ = isModified_ ? "+" : "";
-
-      const dir = await fn.getcwd(args.denops) as string;
-
-      return {
-        word: `${bufnr_} ${curmarker_}${altmarker_} ${modmarker_} ${relative(dir, path)}`,
-        action: {
-          bufNr: bufnr_,
-          path: path,
-          isCurrent: isCurrent_,
-          isAlternate: isAlternate_,
-          isModified: isModified_,
-        }
-      };
-    };
-
-    const get_buflist = async() => {
-      const buffers: Item<ActionData>[] = [];
-      const lastnr_ = await fn.bufnr(args.denops, "$");
-      const altnr_ = await fn.bufnr(args.denops, "#");
-
-      let path = "";
-      path = await fn.expand(args.denops, `#${altnr_}:p`);
-      if (await fn.filereadable(args.denops, path)) {
-        buffers.push(await get_actioninfo(altnr_, path));
-      }
-
-      for (let i = 1; i <= lastnr_; ++i ) {
-        if (i === altnr_) {
-          continue;
-        }
-
-        if (! await fn.bufexists(args.denops, i)) {
-          continue;
-        }
-
-        if (! await fn.buflisted(args.denops, i)) {
-          continue;
-        }
-
-        path = await fn.expand(args.denops, `#${i}:p`);
-        if (! await fn.filereadable(args.denops, path)) {
-          continue;
-        }
-
-        buffers.push(await get_actioninfo(i, path));
-      }
-      return buffers;
-    };
-
     return new ReadableStream({
       async start(controller) {
+        const buffers: number[] = [];
+        const currentBuf = await fn.bufnr(args.denops, "%");
+        const altBuf = await fn.bufnr(args.denops, "#");
+        if (currentBuf != -1) {
+          buffers.push(currentBuf);
+        }
+        if (altBuf != -1) {
+          buffers.push(altBuf);
+        }
+        const listed = await args.denops.eval(
+          "filter(range(1, bufnr('$')), {_, bufnr -> bufexists(bufnr) && buflisted(bufnr)})",
+        ) as number[];
+        for (const l of listed) {
+          if (!buffers.includes(l)) {
+            buffers.push(l);
+          }
+        }
+
+        const items: Item<ActionData>[] = [];
+        for (const b of buffers) {
+          const [name, modified] = await gather(
+            args.denops,
+            async (denops: Denops) => {
+              await fn.bufname(denops, b);
+              await fn.getbufvar(denops, b, "&modified");
+            },
+          );
+
+          const kindMarker = (b == currentBuf)
+            ? "%"
+            : (b == altBuf)
+            ? "#"
+            : " ";
+          const modmarker = modified ? "+" : " ";
+
+          items.push({
+            word: `${b} ${kindMarker} ${modmarker} ${name || "[No Name]"}`,
+            action: {
+              bufNr: b,
+            },
+          });
+        }
+
         controller.enqueue(
-          await get_buflist(),
+          items,
         );
         controller.close();
       },
     });
   }
+
+  actions = {
+    delete: async ({ denops, items }: ActionArguments<Params>) => {
+      for (const item of items) {
+        const action = item?.action as ActionData;
+        if (item.action) {
+          try {
+            await denops.cmd(`bdelete! ${action.bufNr}`);
+          } catch (e) {
+            console.log(e);
+          }
+        }
+      }
+      return Promise.resolve(ActionFlags.RefreshItems);
+    },
+  };
 
   params(): Params {
     return {};
